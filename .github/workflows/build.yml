@@ -40,48 +40,48 @@ jobs:
           ccache -M 10G # Set max cache size (adjust as needed)
           ccache -z   # Zero statistics
 
-      - name: Download and Setup Clang Toolchain (Proton Clang)
+      - name: Download and Setup Clang Toolchain (Proton Clang - Pinned Version)
         run: |
           set -e # Exit immediately if a command exits with a non-zero status.
-          echo "::group::Setup Proton Clang"
+          echo "::group::Setup Proton Clang (Pinned Version from Image)"
 
-          # --- Use Proton Clang for better stability ---
-          CLANG_REPO="kdrag0n/proton-clang"
-          # Use 'latest' for the newest, or pin to a specific version tag like "13.0.0-20211017" if needed
-          CLANG_TAG="latest"
+          # --- Use a PINNED version of Proton Clang for maximum stability ---
+          # >>> IMPORTANT: This tag is based on the provided screenshot from 2021. <<<
+          # >>> It's HIGHLY RECOMMENDED to check the LIVE releases page:        <<<
+          # >>> https://github.com/kdrag0n/proton-clang/releases              <<<
+          # >>> And choose a more recent STABLE tag (e.g., a later 13.x or 14.x) <<<
+          # >>> if compatible with your kernel source for better results.       <<<
+          CLANG_TAG_PINNED="20210522" # TAG FROM SCREENSHOT - CONSIDER UPDATING
+          # --------------------------------------------------------------------
+
           CLANG_DIR="$GITHUB_WORKSPACE/proton-clang"
+          CLANG_ARCHIVE="proton-clang-${CLANG_TAG_PINNED}.tar.xz" # Assuming .tar.xz format, check asset name on release page if unsure
+          PROTON_CLANG_URL="https://github.com/kdrag0n/proton-clang/releases/download/${CLANG_TAG_PINNED}/${CLANG_ARCHIVE}"
 
-          # Construct download URL from GitHub Releases API or directly if format is known
-          # Getting the 'latest' tag URL robustly often involves API calls or redirects.
-          # For simplicity, let's try constructing the expected URL format for latest.
-          # If this fails, use a specific TAG and its known asset URL.
-          echo "Attempting to download latest Proton Clang..."
-          PROTON_CLANG_URL=$(wget -qO- "https://api.github.com/repos/${CLANG_REPO}/releases/latest" | grep -oP '"browser_download_url": "\K(.*)(?=")')
-          # Fallback or specific version if latest API fails or you want to pin:
-          # PROTON_CLANG_URL="https://github.com/${CLANG_REPO}/releases/download/<TAG>/proton-clang-<TAG>.tar.xz"
+          # Check if the asset actually exists with .tar.xz, sometimes older releases might have different formats
+          echo "Verifying asset URL format for tag ${CLANG_TAG_PINNED}..."
+          # Simple check using curl head request (less reliable than API but avoids parsing)
+          # curl --output /dev/null --silent --head --fail "${PROTON_CLANG_URL}" || echo "::warning:: Direct .tar.xz URL might be incorrect for tag ${CLANG_TAG_PINNED}. Check release page assets manually if download fails."
 
-          if [ -z "$PROTON_CLANG_URL" ]; then
-             echo "::warning::Could not automatically determine latest Proton Clang URL. Trying a known recent tag."
-             # Example: Pin to a known good recent version
-             CLANG_TAG_PINNED="13.0.0_20211017" # Check proton-clang releases for current tags
-             PROTON_CLANG_URL="https://github.com/${CLANG_REPO}/releases/download/${CLANG_TAG_PINNED}/proton-clang-${CLANG_TAG_PINNED}.tar.xz"
-          fi
 
-          echo "Downloading Proton Clang from: $PROTON_CLANG_URL"
+          echo "Using Pinned Proton Clang Tag: ${CLANG_TAG_PINNED}"
+          echo "Downloading from fixed URL: ${PROTON_CLANG_URL}"
+
           mkdir -p "$CLANG_DIR"
-          wget --progress=dot:mega -O proton-clang.tar.xz "$PROTON_CLANG_URL" \
-            || { echo "::error::Failed to download Proton Clang from $PROTON_CLANG_URL!"; exit 1; }
+          # Use curl for potentially better redirect handling and error reporting
+          curl -L --retry 3 --retry-delay 5 -o "${CLANG_ARCHIVE}" "${PROTON_CLANG_URL}" \
+             || { echo "::error::Failed to download Proton Clang (Pinned Version) from ${PROTON_CLANG_URL}"; echo "::error::Double-check the tag '${CLANG_TAG_PINNED}' and the asset filename format on the releases page."; exit 1; }
 
           echo "Extracting Proton Clang..."
           # Use tar directly for .xz
-          tar -xf proton-clang.tar.xz -C "$CLANG_DIR" --strip-components=1 \
+          tar -xf "${CLANG_ARCHIVE}" -C "$CLANG_DIR" --strip-components=1 \
              || { echo "::error::Failed to extract Proton Clang!"; exit 1; }
-          rm proton-clang.tar.xz
+          rm "${CLANG_ARCHIVE}"
 
-          # Add to PATH and set environment variables (should be compatible)
+          # Add to PATH and set environment variables (Remain the same)
           echo "Adding Proton Clang to PATH and setting build environment variables..."
           echo "$CLANG_DIR/bin" >> $GITHUB_PATH
-          # Keep the rest of the environment variables as they are standard for Clang/LLVM
+          # ... (Rest of the environment variables remain the same as before) ...
           echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
           echo "ARCH=arm64" >> $GITHUB_ENV
           echo "SUBARCH=arm64" >> $GITHUB_ENV
@@ -99,16 +99,13 @@ jobs:
           echo "HOSTCXX=g++" >> $GITHUB_ENV
           echo "CCACHE_EXEC=/usr/bin/ccache" >> $GITHUB_ENV
           echo "USE_CCACHE=1" >> $GITHUB_ENV
-          # Ensure ccache path prepending is correct
-          echo 'PATH="/usr/lib/ccache:'"$CLANG_DIR/bin"':$PATH"' >> $GITHUB_ENV
+          echo 'PATH="/usr/lib/ccache:'"$CLANG_DIR/bin"':$PATH"' >> $GITHUB_ENV # Prepend ccache path
 
           echo "Proton Clang setup complete. Version:"
           # Verify clang is found and works
           which clang || { echo "::error::Clang binary not found in PATH!"; exit 1; }
           clang --version || { echo "::error::clang --version command failed!"; exit 1; }
           echo "::endgroup::"
-
-
 
       - name: Clone Kernel Source
         run: |
