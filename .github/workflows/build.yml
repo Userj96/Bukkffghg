@@ -40,32 +40,54 @@ jobs:
           ccache -M 10G # Set max cache size (adjust as needed)
           ccache -z   # Zero statistics
 
-      - name: Download and Setup Clang Toolchain (Google's Stable Version)
+      - name: Download and Setup Clang Toolchain (Proton Clang)
         run: |
-          set -e
-          echo "::group::Setup Clang"
-          # Using a specific stable tag is generally safer than 'latest'
-          CLANG_VERSION="14.0.7" # Example: Use a known stable version from AOSP prebuilts
-          CLANG_REL="android-13.0.0_r45" # Corresponding AOSP release tag for this Clang version
-          CLANG_DIR="$GITHUB_WORKSPACE/clang-llvm"
-          TOOLCHAIN_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/$CLANG_REL/clang-$CLANG_VERSION.tar.gz"
+          set -e # Exit immediately if a command exits with a non-zero status.
+          echo "::group::Setup Proton Clang"
 
-          echo "Downloading Clang $CLANG_VERSION from $TOOLCHAIN_URL"
+          # --- Use Proton Clang for better stability ---
+          CLANG_REPO="kdrag0n/proton-clang"
+          # Use 'latest' for the newest, or pin to a specific version tag like "13.0.0-20211017" if needed
+          CLANG_TAG="latest"
+          CLANG_DIR="$GITHUB_WORKSPACE/proton-clang"
+
+          # Construct download URL from GitHub Releases API or directly if format is known
+          # Getting the 'latest' tag URL robustly often involves API calls or redirects.
+          # For simplicity, let's try constructing the expected URL format for latest.
+          # If this fails, use a specific TAG and its known asset URL.
+          echo "Attempting to download latest Proton Clang..."
+          PROTON_CLANG_URL=$(wget -qO- "https://api.github.com/repos/${CLANG_REPO}/releases/latest" | grep -oP '"browser_download_url": "\K(.*)(?=")')
+          # Fallback or specific version if latest API fails or you want to pin:
+          # PROTON_CLANG_URL="https://github.com/${CLANG_REPO}/releases/download/<TAG>/proton-clang-<TAG>.tar.xz"
+
+          if [ -z "$PROTON_CLANG_URL" ]; then
+             echo "::warning::Could not automatically determine latest Proton Clang URL. Trying a known recent tag."
+             # Example: Pin to a known good recent version
+             CLANG_TAG_PINNED="13.0.0_20211017" # Check proton-clang releases for current tags
+             PROTON_CLANG_URL="https://github.com/${CLANG_REPO}/releases/download/${CLANG_TAG_PINNED}/proton-clang-${CLANG_TAG_PINNED}.tar.xz"
+          fi
+
+          echo "Downloading Proton Clang from: $PROTON_CLANG_URL"
           mkdir -p "$CLANG_DIR"
-          wget -q "$TOOLCHAIN_URL" -O clang.tar.gz || { echo "::error::Failed to download Clang!"; exit 1; }
-          tar -xzf clang.tar.gz -C "$CLANG_DIR" || { echo "::error::Failed to extract Clang!"; exit 1; }
-          rm clang.tar.gz
+          wget --progress=dot:mega -O proton-clang.tar.xz "$PROTON_CLANG_URL" \
+            || { echo "::error::Failed to download Proton Clang from $PROTON_CLANG_URL!"; exit 1; }
 
-          # Add to PATH and set environment variables
-          echo "Adding Clang to PATH and setting build environment variables..."
+          echo "Extracting Proton Clang..."
+          # Use tar directly for .xz
+          tar -xf proton-clang.tar.xz -C "$CLANG_DIR" --strip-components=1 \
+             || { echo "::error::Failed to extract Proton Clang!"; exit 1; }
+          rm proton-clang.tar.xz
+
+          # Add to PATH and set environment variables (should be compatible)
+          echo "Adding Proton Clang to PATH and setting build environment variables..."
           echo "$CLANG_DIR/bin" >> $GITHUB_PATH
+          # Keep the rest of the environment variables as they are standard for Clang/LLVM
           echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
           echo "ARCH=arm64" >> $GITHUB_ENV
           echo "SUBARCH=arm64" >> $GITHUB_ENV
           echo "CLANG_TRIPLE=aarch64-linux-gnu-" >> $GITHUB_ENV
           echo "LLVM=1" >> $GITHUB_ENV
           echo "LLVM_IAS=1" >> $GITHUB_ENV
-          # Explicitly point CC/LD etc to clang/lld via toolchain wrapper
           echo "CC=clang" >> $GITHUB_ENV
           echo "LD=ld.lld" >> $GITHUB_ENV
           echo "AR=llvm-ar" >> $GITHUB_ENV
@@ -73,19 +95,20 @@ jobs:
           echo "OBJCOPY=llvm-objcopy" >> $GITHUB_ENV
           echo "OBJDUMP=llvm-objdump" >> $GITHUB_ENV
           echo "STRIP=llvm-strip" >> $GITHUB_ENV
-          # Explicit Host tools
           echo "HOSTCC=gcc" >> $GITHUB_ENV
           echo "HOSTCXX=g++" >> $GITHUB_ENV
-          # Ensure clang uses ccache
           echo "CCACHE_EXEC=/usr/bin/ccache" >> $GITHUB_ENV
           echo "USE_CCACHE=1" >> $GITHUB_ENV
-          echo 'PATH="/usr/lib/ccache:'"$CLANG_DIR/bin"':$PATH"' >> $GITHUB_ENV # Prepend ccache path
+          # Ensure ccache path prepending is correct
+          echo 'PATH="/usr/lib/ccache:'"$CLANG_DIR/bin"':$PATH"' >> $GITHUB_ENV
 
-          echo "Clang setup complete. Version:"
-          clang --version
-          which clang
-          which aarch64-linux-gnu-gcc # Should NOT be found unless gcc-aarch64-linux-gnu is installed, which we don't need when using Clang cross-compilation
+          echo "Proton Clang setup complete. Version:"
+          # Verify clang is found and works
+          which clang || { echo "::error::Clang binary not found in PATH!"; exit 1; }
+          clang --version || { echo "::error::clang --version command failed!"; exit 1; }
           echo "::endgroup::"
+
+
 
       - name: Clone Kernel Source
         run: |
