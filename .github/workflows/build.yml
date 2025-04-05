@@ -1,0 +1,309 @@
+name: Build OnePlus Kernel with SUSFS (Optimized)
+
+on:
+  workflow_dispatch: # Allows manual triggering from the Actions tab
+
+jobs:
+  build_kernel:
+    name: Build Kernel
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Allow writing releases/artifacts if needed later
+
+    steps:
+      - name: Checkout Workflow Repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Maximize Build Space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 512
+          swap-size-mb: 1024 # Increase swap slightly for kernel builds
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          # Keep build tools like gcc/clang
+
+      - name: Install Build Dependencies and ccache
+        run: |
+          set -e # Exit immediately if a command exits with a non-zero status.
+          echo "::group::Install Dependencies"
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            bc binutils build-essential cpio flex git kmod libelf-dev libncurses5-dev libssl-dev \
+            python3 python3-pip rsync bison dwarves wget unzip ca-certificates xz-utils \
+            make gcc clang llvm lld ccache
+          echo "::endgroup::"
+          # Configure ccache
+          ccache -M 10G # Set max cache size (adjust as needed)
+          ccache -z   # Zero statistics
+
+      - name: Download and Setup Clang Toolchain (Google's Stable Version)
+        run: |
+          set -e
+          echo "::group::Setup Clang"
+          # Using a specific stable tag is generally safer than 'latest'
+          CLANG_VERSION="14.0.7" # Example: Use a known stable version from AOSP prebuilts
+          CLANG_REL="android-13.0.0_r45" # Corresponding AOSP release tag for this Clang version
+          CLANG_DIR="$GITHUB_WORKSPACE/clang-llvm"
+          TOOLCHAIN_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/$CLANG_REL/clang-$CLANG_VERSION.tar.gz"
+
+          echo "Downloading Clang $CLANG_VERSION from $TOOLCHAIN_URL"
+          mkdir -p "$CLANG_DIR"
+          wget -q "$TOOLCHAIN_URL" -O clang.tar.gz || { echo "::error::Failed to download Clang!"; exit 1; }
+          tar -xzf clang.tar.gz -C "$CLANG_DIR" || { echo "::error::Failed to extract Clang!"; exit 1; }
+          rm clang.tar.gz
+
+          # Add to PATH and set environment variables
+          echo "Adding Clang to PATH and setting build environment variables..."
+          echo "$CLANG_DIR/bin" >> $GITHUB_PATH
+          echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
+          echo "ARCH=arm64" >> $GITHUB_ENV
+          echo "SUBARCH=arm64" >> $GITHUB_ENV
+          echo "CLANG_TRIPLE=aarch64-linux-gnu-" >> $GITHUB_ENV
+          echo "LLVM=1" >> $GITHUB_ENV
+          echo "LLVM_IAS=1" >> $GITHUB_ENV
+          # Explicitly point CC/LD etc to clang/lld via toolchain wrapper
+          echo "CC=clang" >> $GITHUB_ENV
+          echo "LD=ld.lld" >> $GITHUB_ENV
+          echo "AR=llvm-ar" >> $GITHUB_ENV
+          echo "NM=llvm-nm" >> $GITHUB_ENV
+          echo "OBJCOPY=llvm-objcopy" >> $GITHUB_ENV
+          echo "OBJDUMP=llvm-objdump" >> $GITHUB_ENV
+          echo "STRIP=llvm-strip" >> $GITHUB_ENV
+          # Explicit Host tools
+          echo "HOSTCC=gcc" >> $GITHUB_ENV
+          echo "HOSTCXX=g++" >> $GITHUB_ENV
+          # Ensure clang uses ccache
+          echo "CCACHE_EXEC=/usr/bin/ccache" >> $GITHUB_ENV
+          echo "USE_CCACHE=1" >> $GITHUB_ENV
+          echo 'PATH="/usr/lib/ccache:'"$CLANG_DIR/bin"':$PATH"' >> $GITHUB_ENV # Prepend ccache path
+
+          echo "Clang setup complete. Version:"
+          clang --version
+          which clang
+          which aarch64-linux-gnu-gcc # Should NOT be found unless gcc-aarch64-linux-gnu is installed, which we don't need when using Clang cross-compilation
+          echo "::endgroup::"
+
+      - name: Clone Kernel Source
+        run: |
+          set -e
+          echo "::group::Clone Kernel Source"
+          git clone --depth=1 https://github.com/Userj96/android_kernel_5.10_oneplus_mt6983.git -b oneplus/mt6983_v_15.0.0_nord_3 $GITHUB_WORKSPACE/kernel \
+            || { echo "::error::Failed to clone kernel source!"; exit 1; }
+          echo "KERNEL_ROOT=$GITHUB_WORKSPACE/kernel" >> $GITHUB_ENV
+          echo "Kernel source cloned."
+          echo "::endgroup::"
+
+      - name: Clone SUSFS Project
+        run: |
+          set -e
+          echo "::group::Clone SUSFS Project"
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git $GITHUB_WORKSPACE/susfs_project \
+            || { echo "::error::Failed to clone SUSFS project!"; exit 1; }
+          echo "SUSFS_ROOT=$GITHUB_WORKSPACE/susfs_project" >> $GITHUB_ENV
+          echo "SUSFS project cloned."
+          echo "::endgroup::"
+
+      - name: Patch Kernel Source
+        run: |
+          # --- CRITICAL STEP: PATCH COMPATIBILITY ---
+          # This step WILL FAIL if the patches from simonpunk/susfs4ksu
+          # are not compatible with the EXACT kernel source commit being used.
+          # If it fails, you MUST fork susfs4ksu, manually fix the patches
+          # in your fork to match the kernel source, and update the clone URL above.
+          # ------------------------------------------
+          set -e
+          echo "::group::Patch Kernel Source"
+          cd $SUSFS_ROOT
+
+          # Determine kernel source directory for KernelSU (check common locations)
+          KSU_DRIVER_DIR="$KERNEL_ROOT/drivers/kernelsu"
+          if [ ! -d "$KSU_DRIVER_DIR" ]; then
+             # Fallback or alternative location if needed
+             # KSU_DRIVER_DIR="$KERNEL_ROOT/some/other/path"
+             echo "::warning::KernelSU driver directory not found at default location ($KSU_DRIVER_DIR), check kernel source structure."
+             # Attempt default anyway, patch command below will fail if incorrect
+             KSU_DRIVER_DIR="$KERNEL_ROOT/drivers/kernelsu"
+             mkdir -p $KSU_DRIVER_DIR # Create if totally missing, though patch will likely fail
+          fi
+          echo "Using KernelSU driver directory: $KSU_DRIVER_DIR"
+
+          # Copy files first
+          echo "Copying patch files..."
+          cp ./kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch "$KSU_DRIVER_DIR/" || { echo "::error::Failed to copy KSU patch file!"; exit 1; }
+          cp ./kernel_patches/fs/susfs.c $KERNEL_ROOT/fs/ || { echo "::error::Failed to copy susfs.c!"; exit 1; }
+          cp ./kernel_patches/include/linux/susfs.h $KERNEL_ROOT/include/linux/ || { echo "::error::Failed to copy susfs.h!"; exit 1; }
+
+          # Identify the correct 5.10 kernel patch file robustly
+          SUSFS_KERNEL_PATCH=$(find ./kernel_patches/ -maxdepth 1 -name '50_add_susfs_in_kernel-5.10*.patch' | head -n 1)
+          if [ -z "$SUSFS_KERNEL_PATCH" ]; then
+            echo "::error::Could not find SUSFS kernel patch matching '50_add_susfs_in_kernel-5.10*.patch'!"
+            exit 1
+          fi
+          echo "Using kernel patch file: $SUSFS_KERNEL_PATCH"
+          cp "$SUSFS_KERNEL_PATCH" "$KERNEL_ROOT/" || { echo "::error::Failed to copy main kernel patch file!"; exit 1; }
+          PATCH_FILENAME=$(basename "$SUSFS_KERNEL_PATCH") # Get just the filename for the patch command
+
+          # Apply patches - Bail out immediately if any fail
+          echo "Applying KernelSU patch..."
+          cd "$KSU_DRIVER_DIR"
+          patch -p1 --verbose --ignore-whitespace < 10_enable_susfs_for_ksu.patch \
+            || { echo "::error::Failed to apply KernelSU SUSFS patch! Check patch compatibility with $KSU_DRIVER_DIR structure."; exit 1; }
+
+          echo "Applying main SUSFS kernel patch..."
+          cd $KERNEL_ROOT
+          patch -p1 --verbose --ignore-whitespace < "$PATCH_FILENAME" \
+            || { echo "::error::Failed to apply main SUSFS kernel patch ($PATCH_FILENAME)! Check patch compatibility with kernel source."; exit 1; }
+
+          echo "Kernel Patched Successfully."
+          echo "::endgroup::"
+
+      - name: Configure Kernel
+        run: |
+          set -e
+          echo "::group::Configure Kernel"
+          cd $KERNEL_ROOT
+          export KERNEL_OUT_DIR=$KERNEL_ROOT/out
+          mkdir -p $KERNEL_OUT_DIR
+
+          # Select the specific defconfig identified: k6893v1_64_k510_defconfig
+          DEFCONFIG_NAME="k6893v1_64_k510_defconfig"
+          echo "Using defconfig: $DEFCONFIG_NAME"
+          if [ ! -f "arch/arm64/configs/$DEFCONFIG_NAME" ]; then
+              echo "::error::Defconfig file arch/arm64/configs/$DEFCONFIG_NAME not found!"
+              exit 1
+          fi
+          make O=$KERNEL_OUT_DIR ARCH=arm64 $DEFCONFIG_NAME \
+               HOSTCC="$HOSTCC" HOSTCXX="$HOSTCXX" \
+               CC="$CC" LD="$LD" AR="$AR" NM="$NM" OBJCOPY="$OBJCOPY" OBJDUMP="$OBJDUMP" STRIP="$STRIP" \
+               CROSS_COMPILE="$CROSS_COMPILE" CLANG_TRIPLE="$CLANG_TRIPLE" LLVM=1 LLVM_IAS=1 \
+               USE_CCACHE=1 CCACHE_EXEC="$CCACHE_EXEC" \
+            || { echo "::error::'make defconfig' failed!"; exit 1; }
+
+          # Enable KernelSU and SUSFS using kernel config script
+          echo "Enabling KernelSU and SUSFS config options..."
+          CONFIG_SCRIPT="./scripts/config"
+          OUT_CONFIG_FILE="$KERNEL_OUT_DIR/.config"
+
+          if [ ! -f "$CONFIG_SCRIPT" ]; then
+              echo "::error::Kernel config script not found at $CONFIG_SCRIPT!"
+              exit 1
+          fi
+           if [ ! -f "$OUT_CONFIG_FILE" ]; then
+              echo "::error::Output .config file not found after make defconfig at $OUT_CONFIG_FILE!"
+              exit 1
+          fi
+
+          $CONFIG_SCRIPT --file "$OUT_CONFIG_FILE" --enable CONFIG_KSU
+          # $CONFIG_SCRIPT --file "$OUT_CONFIG_FILE" --set-str CONFIG_KSU_DESCRIPTION "KernelSU+SUSFS" # Optional: Uncomment to set description
+          $CONFIG_SCRIPT --file "$OUT_CONFIG_FILE" --enable CONFIG_KSU_SUSFS
+
+          # Optional: Disable problematic configs if needed (e.g., LTO if memory issues)
+          # echo "Checking/Disabling LTO..."
+          # $CONFIG_SCRIPT --file "$OUT_CONFIG_FILE" --disable CONFIG_LTO_CLANG
+          # $CONFIG_SCRIPT --file "$OUT_CONFIG_FILE" --disable CONFIG_LTO_CLANG_THIN
+
+          # Apply changes and update config based on dependencies
+          echo "Running 'make olddefconfig' to apply changes..."
+          make O=$KERNEL_OUT_DIR ARCH=arm64 olddefconfig \
+               HOSTCC="$HOSTCC" HOSTCXX="$HOSTCXX" \
+               CC="$CC" LD="$LD" AR="$AR" NM="$NM" OBJCOPY="$OBJCOPY" OBJDUMP="$OBJDUMP" STRIP="$STRIP" \
+               CROSS_COMPILE="$CROSS_COMPILE" CLANG_TRIPLE="$CLANG_TRIPLE" LLVM=1 LLVM_IAS=1 \
+               USE_CCACHE=1 CCACHE_EXEC="$CCACHE_EXEC" \
+            || { echo "::error::'make olddefconfig' failed!"; exit 1; }
+          echo "Kernel Configured."
+          echo "::endgroup::"
+
+      - name: Build Kernel Image
+        run: |
+          set -e
+          echo "::group::Build Kernel Image"
+          cd $KERNEL_ROOT
+          export KERNEL_OUT_DIR=$KERNEL_ROOT/out
+
+          echo "Starting kernel build with $(nproc) cores..."
+          BUILD_START=$(date +"%s")
+          make O=$KERNEL_OUT_DIR ARCH=arm64 -j$(nproc) \
+               HOSTCC="$HOSTCC" HOSTCXX="$HOSTCXX" \
+               CC="$CC" LD="$LD" AR="$AR" NM="$NM" OBJCOPY="$OBJCOPY" OBJDUMP="$OBJDUMP" STRIP="$STRIP" \
+               CROSS_COMPILE="$CROSS_COMPILE" CLANG_TRIPLE="$CLANG_TRIPLE" LLVM=1 LLVM_IAS=1 \
+               USE_CCACHE=1 CCACHE_EXEC="$CCACHE_EXEC" \
+               Image \
+            || { echo "::error::Kernel Image build failed! Check logs for C compilation errors."; exit 1; }
+          BUILD_END=$(date +"%s")
+          DIFF=$((BUILD_END - BUILD_START))
+          echo "Kernel build finished in $(($DIFF / 60)) minutes and $(($DIFF % 60)) seconds."
+
+          # Verify Image exists
+          export KERNEL_IMAGE_PATH=$KERNEL_OUT_DIR/arch/arm64/boot/Image
+          if [ ! -f "$KERNEL_IMAGE_PATH" ]; then
+              echo "::error::Kernel Image not found at expected path: $KERNEL_IMAGE_PATH"
+              echo "Listing contents of $KERNEL_OUT_DIR/arch/arm64/boot/:"
+              ls -alh $KERNEL_OUT_DIR/arch/arm64/boot/
+              exit 1
+          fi
+          echo "Kernel Image built successfully: $KERNEL_IMAGE_PATH"
+          ls -lh $KERNEL_IMAGE_PATH
+          echo "::endgroup::"
+          # Display ccache statistics
+          echo "::group::ccache statistics"
+          ccache -s
+          echo "::endgroup::"
+
+
+      - name: Build SUSFS Userspace Tool
+        run: |
+          set -e
+          echo "::group::Build ksu_susfs tool"
+          cd $SUSFS_ROOT
+          # Assuming the script correctly uses ARCH=arm64 or picks up env vars
+          echo "Running ./build_ksu_susfs_tool.sh..."
+          ./build_ksu_susfs_tool.sh \
+            || { echo "::error::Failed to build ksu_susfs tool!"; exit 1; }
+
+          # Verify output exists (adjust path if build script places it elsewhere)
+          export KSU_SUSFS_TOOL_PATH=$SUSFS_ROOT/ksu_module_susfs/tools/arm64/ksu_susfs
+           if [ ! -f "$KSU_SUSFS_TOOL_PATH" ]; then
+              echo "::error::ksu_susfs tool not found at expected path: $KSU_SUSFS_TOOL_PATH"
+              echo "Listing contents of $SUSFS_ROOT/ksu_module_susfs/tools/arm64/:"
+              ls -alh $SUSFS_ROOT/ksu_module_susfs/tools/arm64/
+              exit 1
+           fi
+           echo "ksu_susfs tool built successfully: $KSU_SUSFS_TOOL_PATH"
+           ls -lh $KSU_SUSFS_TOOL_PATH
+           echo "::endgroup::"
+
+      - name: Build KernelSU Module
+        run: |
+          set -e
+          echo "::group::Build ksu_module_susfs module zip"
+          cd $SUSFS_ROOT
+          echo "Running ./build_ksu_module.sh..."
+          ./build_ksu_module.sh \
+            || { echo "::error::Failed to build ksu_module_susfs zip!"; exit 1; }
+
+          # Verify output exists (adjust path if build script places it elsewhere)
+          export KSU_MODULE_ZIP_PATH=$SUSFS_ROOT/ksu_module_susfs.zip
+           if [ ! -f "$KSU_MODULE_ZIP_PATH" ]; then
+              echo "::error::ksu_module_susfs.zip not found at expected path: $KSU_MODULE_ZIP_PATH"
+               echo "Listing contents of $SUSFS_ROOT:"
+               ls -alh $SUSFS_ROOT
+              exit 1
+           fi
+           echo "ksu_module_susfs module built successfully: $KSU_MODULE_ZIP_PATH"
+           ls -lh $KSU_MODULE_ZIP_PATH
+           echo "::endgroup::"
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: SUSFS-Kernel-Build-${{ github.run_id }}
+          path: |
+            ${{ env.KERNEL_IMAGE_PATH }}
+            ${{ env.KSU_SUSFS_TOOL_PATH }}
+            ${{ env.KSU_MODULE_ZIP_PATH }}
+          # You can customize retention days as needed
+          retention-days: 7
